@@ -5,7 +5,8 @@ import logging
 import os
 import schedule
 import time
-import shlex
+import hashlib
+import tempfile
 import re
 import sys
 
@@ -14,9 +15,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Constants
 DEFAULT_SCHEDULE = "daily"  # Default scan schedule
-VALID_SCHEDULES = ["daily", "weekly", "monthly", "once"]  # Valid scan schedules
+VALID_SCHEDULES = ["daily", "weekly", "once"]  # The schedule library has no monthly unit, so monthly is not offered
 SECRETS_REPORT_FILENAME = "secrets_report.json"
-VULN_REPORT_FILENAME = "vulnerability_report.json"
+NUCLEI_REPORT_FILENAME = "nuclei_report.jsonl"
+TESTSSL_REPORT_FILENAME = "testssl_report.json"
+VULN_REPORT_FILENAME = NUCLEI_REPORT_FILENAME  # Kept for compatibility; nuclei output only
+
+
+def mask_secret_values(obj):
+    """Recursively mask values held under secret-like keys."""
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            lowered = str(key).lower()
+            if isinstance(value, str) and "[REDACTED" not in value and any(word in lowered for word in ("secret", "password", "token", "api_key", "apikey")):
+                digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:8]
+                out[key] = f"{value[:4]}...[REDACTED sha256:{digest}]"
+            else:
+                out[key] = mask_secret_values(value)
+        return out
+    if isinstance(obj, list):
+        return [mask_secret_values(item) for item in obj]
+    return obj
 
 def setup_argparse():
     """Sets up the argument parser for the CLI."""
@@ -84,17 +104,27 @@ def scan_secrets(target):
     """Scans the target repository for exposed secrets using detect-secrets."""
     logging.info(f"Scanning for secrets in: {target}")
     try:
-        # Run detect-secrets command
-        command = ["detect-secrets", "scan", "--json", SECRETS_REPORT_FILENAME, target]
-        result = subprocess.run(command, check=False, capture_output=True, text=True)  # Do not raise on non-zero exit code
+        # detect-secrets writes its JSON report to stdout; the scanned
+        # path is the only scan argument. Capture and parse that JSON.
+        command = ["detect-secrets", "scan", target]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
 
-        if result.returncode != 0 and "No secrets found!" not in result.stderr:
-            logging.warning(f"detect-secrets returned a non-zero exit code: {result.returncode}. Error Output: {result.stderr}")
-        elif "No secrets found!" in result.stderr:
-            logging.info("No secrets found in the repository.")
-            # Create an empty JSON file to indicate no secrets found
-            with open(SECRETS_REPORT_FILENAME, 'w') as f:
-                json.dump({}, f)
+        if result.returncode != 0:
+            logging.error(f"detect-secrets returned a non-zero exit code: {result.returncode}. Error Output: {result.stderr}")
+            return False
+
+        stdout = (result.stdout or "").strip()
+        if stdout:
+            try:
+                parsed = json.loads(stdout)
+            except json.JSONDecodeError as e:
+                logging.error(f"Could not parse detect-secrets JSON output: {e}")
+                return False
+        else:
+            parsed = {}
+
+        with open(SECRETS_REPORT_FILENAME, 'w') as f:
+            json.dump(mask_secret_values(parsed), f, indent=4)
 
         logging.info("Secret scanning completed.")
 
@@ -121,13 +151,13 @@ def run_nuclei(target):
             logging.warning(f"Target {target} doesn't appear to be a URL.  Skipping Nuclei scan.  Consider prepending with http:// or https://")
             return False  # Nuclei expects a URL
 
-        command = ["nuclei", "-u", target, "-json", "-o", VULN_REPORT_FILENAME]
+        command = ["nuclei", "-u", target, "-json", "-o", NUCLEI_REPORT_FILENAME]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
 
         if result.returncode != 0:
-            logging.warning(f"Nuclei returned a non-zero exit code: {result.returncode}. Error Output: {result.stderr}")
-        else:
-            logging.info(f"Nuclei scan completed. Output saved to {VULN_REPORT_FILENAME}")
+            logging.error(f"Nuclei returned a non-zero exit code: {result.returncode}. Error Output: {result.stderr}")
+            return False
+        logging.info(f"Nuclei scan completed. Output saved to {NUCLEI_REPORT_FILENAME}")
 
     except FileNotFoundError:
         logging.error("Nuclei not found. Please install it: refer to projectnuclei.io")
@@ -145,13 +175,13 @@ def run_testssl(target):
     logging.info(f"Running testssl.sh against: {target}")
 
     try:
-        command = ["testssl.sh", "--jsonfile", VULN_REPORT_FILENAME, target]
+        command = ["testssl.sh", "--jsonfile", TESTSSL_REPORT_FILENAME, target]
         result = subprocess.run(command, capture_output=True, text=True, check=False)  # Allow non-zero exit codes
 
         if result.returncode != 0:
-            logging.warning(f"testssl.sh returned a non-zero exit code: {result.returncode}. Error output: {result.stderr}")
-        else:
-            logging.info(f"testssl.sh scan completed. Output saved to {VULN_REPORT_FILENAME}")
+            logging.error(f"testssl.sh returned a non-zero exit code: {result.returncode}. Error output: {result.stderr}")
+            return False
+        logging.info(f"testssl.sh scan completed. Output saved to {TESTSSL_REPORT_FILENAME}")
 
     except FileNotFoundError:
         logging.error("testssl.sh not found.  Ensure it's installed and in your PATH.")
@@ -166,53 +196,73 @@ def run_testssl(target):
     return True
 
 
-def consolidate_reports(output_filename="consolidated_report.json"):
+def consolidate_reports(output_filename="consolidated_report.json", tool_statuses=None, scan_status=None):
     """Consolidates the reports generated by different tools into a single JSON file."""
     logging.info("Consolidating reports...")
     consolidated_data = {}
-    try:
-        # Load secrets report
-        if os.path.exists(SECRETS_REPORT_FILENAME):
-            with open(SECRETS_REPORT_FILENAME, "r") as f:
-                consolidated_data["secrets"] = json.load(f)
-        else:
-            consolidated_data["secrets"] = {"status": "No secrets scan performed or no secrets found."}
+    if tool_statuses is not None:
+        consolidated_data["tool_statuses"] = tool_statuses
+    if scan_status is not None:
+        consolidated_data["scan_status"] = scan_status
+    # Secrets report: distinguish not performed, performed with no
+    # findings, and performed with findings.
+    if os.path.exists(SECRETS_REPORT_FILENAME):
+        with open(SECRETS_REPORT_FILENAME, "r") as f:
+            secrets_data = mask_secret_values(json.load(f))
+        results_map = secrets_data.get("results", {}) if isinstance(secrets_data, dict) else {}
+        has_findings = bool(results_map) and any(results_map.values())
+        consolidated_data["secrets"] = {
+            "status": "performed_with_findings" if has_findings else "performed_no_findings",
+            "report": secrets_data,
+        }
+    else:
+        consolidated_data["secrets"] = {"status": "not_performed"}
 
-        # Load vulnerability report
-        if os.path.exists(VULN_REPORT_FILENAME):
-            with open(VULN_REPORT_FILENAME, "r") as f:
-                try:
-                    consolidated_data["vulnerabilities"] = json.load(f)
-                except json.JSONDecodeError as e:
-                    logging.error(f"Error decoding vulnerability report: {e}.  The file might be invalid JSON or empty.")
-                    consolidated_data["vulnerabilities"] = {"error": "Failed to decode vulnerability report.  Check logs for details."}
+    # Vulnerability reports: nuclei writes JSON lines, testssl.sh
+    # writes a single JSON document, each in its own file.
+    vuln = {}
+    if os.path.exists(NUCLEI_REPORT_FILENAME):
+        entries = []
+        with open(NUCLEI_REPORT_FILENAME, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Error decoding a nuclei output line: {e}")
+        vuln["nuclei"] = entries
+    if os.path.exists(TESTSSL_REPORT_FILENAME):
+        with open(TESTSSL_REPORT_FILENAME, "r") as f:
+            try:
+                vuln["testssl"] = json.load(f)
+            except json.JSONDecodeError as e:
+                logging.error(f"Error decoding testssl report: {e}")
+                vuln["testssl"] = {"error": "Failed to decode testssl report."}
+    consolidated_data["vulnerabilities"] = vuln if vuln else {"status": "not_performed"}
 
-        else:
-            consolidated_data["vulnerabilities"] = {"status": "No vulnerability scans performed."}
+    with open(output_filename, "w") as outfile:
+        json.dump(consolidated_data, outfile, indent=4)
 
-
-        # Write consolidated report to file
-        with open(output_filename, "w") as outfile:
-            json.dump(consolidated_data, outfile, indent=4)
-
-        logging.info(f"Consolidated report saved to: {output_filename}")
-
-    except FileNotFoundError as e:
-        logging.error(f"Report file not found: {e}")
-    except Exception as e:
-        logging.error(f"An error occurred during report consolidation: {e}")
+    logging.info(f"Consolidated report saved to: {output_filename}")
+    return consolidated_data
 
 def perform_scan(target, tools=None):
-    """Performs the vulnerability and secret scanning."""
+    """Performs the vulnerability and secret scanning.
+
+    Returns a tuple (ok, statuses) where statuses maps each selected
+    tool to one of: ran, missing, skipped, failed. ok is True only
+    when every selected tool ran successfully.
+    """
     temp_dir = None # Holds the temporary directory if a clone is needed
+    statuses = {}
 
     try:
         # Determine if the target is a local path or a remote git repository
         if re.match(r'^(http|https)://', target):
             # Assume it is a remote repository URL
             logging.info(f"Target '{target}' looks like a remote URL - attempting to clone.")
-            temp_dir = "temp_repo"
-            os.makedirs(temp_dir, exist_ok=True)  # Create the directory if it does not exist
+            temp_dir = tempfile.mkdtemp(prefix="temp_repo_", dir=".")
             clone_repository(target, temp_dir)
             scan_target = temp_dir # Set the path to scan to the cloned repo
         elif os.path.isdir(target):
@@ -221,41 +271,53 @@ def perform_scan(target, tools=None):
             scan_target = target
         else:
             logging.error(f"Invalid target: {target}. Must be a valid directory path or a remote git URL.")
-            return False
+            return (False, statuses)
 
         # Check if the target is a git repository
         if not is_git_repository(scan_target):
             logging.error(f"Target '{scan_target}' is not a valid git repository.")
-            return False
+            return (False, statuses)
 
         # If no tools are specified, run all available tools
         if not tools:
             tools = ["detect-secrets", "nuclei", "testssl.sh"]
 
-        # Run the specified tools
-        if "detect-secrets" in tools:
-            scan_secrets(scan_target)
-
-        # Run Nuclei if target looks like a URL or a valid directory
-        if "nuclei" in tools and (re.match(r'^(http|https)://', target) or os.path.isdir(target)):
-            if re.match(r'^(http|https)://', target):
-                 run_nuclei(target)  # Run Nuclei directly against the URL
+        def _record(name, ran_ok, missing_hint):
+            if ran_ok:
+                statuses[name] = "ran"
             else:
+                # A False result from a tool that is not on PATH is a
+                # missing tool; the tool functions already logged which.
+                import shutil as _shutil
+                statuses[name] = "missing" if _shutil.which(name) is None else "failed"
+                logging.error(f"Tool {name} did not run successfully ({missing_hint}).")
+
+        if "detect-secrets" in tools:
+            _record("detect-secrets", scan_secrets(scan_target), "see log")
+
+        if "nuclei" in tools:
+            if re.match(r'^(http|https)://', target):
+                _record("nuclei", run_nuclei(target), "see log")
+            else:
+                statuses["nuclei"] = "skipped"
                 logging.info("Skipping Nuclei execution because target is not a URL.")
 
         if "testssl.sh" in tools:
             if re.match(r'^(http|https)://', target):
-                run_testssl(target)
+                _record("testssl.sh", run_testssl(target), "see log")
             else:
+                statuses["testssl.sh"] = "skipped"
                 logging.info("Skipping testssl.sh as it only supports URLs.")
 
-
-
-        return True
+        missing = [name for name, status in statuses.items() if status != "ran"]
+        if missing:
+            logging.error(f"Scan not fully performed. Tools not run successfully: {', '.join(missing)}")
+            return (False, statuses)
+        return (True, statuses)
 
     except Exception as e:
         logging.error(f"An error occurred during the scan: {e}")
-        return False
+        return (False, statuses)
     finally:
         # Clean up the temporary directory if it was created
         if temp_dir and os.path.exists(temp_dir):
@@ -271,24 +333,25 @@ def schedule_scan(target, schedule_type, tools=None):
 
     def scheduled_job():
         logging.info(f"Starting scheduled scan for target: {target}")
-        if perform_scan(target, tools):
+        ok, statuses = perform_scan(target, tools)
+        if ok:
             logging.info(f"Scheduled scan for target: {target} completed successfully.")
-            consolidate_reports() # Generate a report automatically
-        else:
-            logging.error(f"Scheduled scan for target: {target} failed.")
+            consolidate_reports(tool_statuses=statuses, scan_status="completed")
+            return True
+        logging.error(f"Scheduled scan for target: {target} failed or was not fully performed: {statuses}")
+        if statuses:
+            consolidate_reports(tool_statuses=statuses, scan_status="not_performed_or_incomplete")
+        return False
 
     if schedule_type == "daily":
         schedule.every().day.do(scheduled_job)
     elif schedule_type == "weekly":
         schedule.every().week.do(scheduled_job)
-    elif schedule_type == "monthly":
-        schedule.every().month.do(scheduled_job)
     elif schedule_type == "once":
-        scheduled_job() # Run immediately
-        return # Don't enter the scheduling loop
+        return scheduled_job() # Run immediately, no scheduling loop
     else:
         logging.error(f"Invalid schedule type: {schedule_type}")
-        return
+        return False
 
     logging.info(f"Scan scheduled for target: {target} with schedule: {schedule_type}")
     while True:
@@ -305,23 +368,37 @@ def main():
     if args.command == "scan":
         try:
             if args.schedule == "once":
-                 if perform_scan(args.target, args.tools):
-                     consolidate_reports() # generate a report after execution.
-                 else:
-                     logging.error("Scan failed.")
+                ok, statuses = perform_scan(args.target, args.tools)
+                if ok:
+                    consolidate_reports(tool_statuses=statuses, scan_status="completed")
+                elif statuses:
+                    consolidate_reports(tool_statuses=statuses, scan_status="not_performed_or_incomplete")
+                    logging.error("Scan not performed or incomplete. See tool statuses in the consolidated report.")
+                    sys.exit(1)
+                else:
+                    logging.error("Scan failed.")
+                    sys.exit(1)
             else:
-                schedule_scan(args.target, args.schedule, args.tools)
+                result = schedule_scan(args.target, args.schedule, args.tools)
+                if result is False:
+                    sys.exit(1)
+        except SystemExit:
+            raise
         except Exception as e:
             logging.error(f"An error occurred: {e}")
+            sys.exit(1)
 
     elif args.command == "report":
         consolidate_reports(args.output or "consolidated_report.json")
     elif args.command == "list-tools":
         print("Available tools: detect-secrets, nuclei, testssl.sh")
+        print("External prerequisites: detect-secrets, nuclei, and testssl.sh must be installed and on PATH, and git must be installed.")
     elif not args.command:
         parser.print_help()  # Print help if no command is given
+        sys.exit(2)
     else:
         print(f"Unknown command: {args.command}")
+        sys.exit(2)
 
 
 

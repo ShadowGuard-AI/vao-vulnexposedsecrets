@@ -29,11 +29,13 @@ def mask_secret_values(obj):
         for key, value in obj.items():
             lowered = str(key).lower()
             if isinstance(value, str) and "[REDACTED" not in value and any(word in lowered for word in ("secret", "password", "token", "api_key", "apikey")):
+                # Masking keeps the first four characters plus a short hash prefix. That is enough to match two reports against each other and tell whether a value changed, and it is also the first four characters of a secret in plain view, so I would not share a masked report further than I would share the finding itself.
                 digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:8]
                 out[key] = f"{value[:4]}...[REDACTED sha256:{digest}]"
             else:
                 out[key] = mask_secret_values(value)
         return out
+    # Only string values under a secret sounding key get masked. A secret sitting under a plain key like line or value passes through untouched, and a non string secret is recursed into or returned as is, so this is a filter for the known report shapes, not a guarantee about the file.
     if isinstance(obj, list):
         return [mask_secret_values(item) for item in obj]
     return obj
@@ -71,6 +73,7 @@ def is_git_repository(path):
             return True
 
         # If not, check if we are in a git repository using git rev-parse
+        # The rev-parse fallback means a target that is a subfolder of a larger repository counts as a repository. The check passes on the strength of the parent repo, while the scan itself only walks the folder it was given.
         result = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, capture_output=True, text=True)
         if result.returncode == 0 and result.stdout.strip() == "true":
             return True
@@ -211,6 +214,7 @@ def consolidate_reports(output_filename="consolidated_report.json", tool_statuse
             secrets_data = mask_secret_values(json.load(f))
         results_map = secrets_data.get("results", {}) if isinstance(secrets_data, dict) else {}
         has_findings = bool(results_map) and any(results_map.values())
+        # This reads whatever secrets report file sits in the working directory. If the current run failed before writing a fresh one, a file left by an earlier run is consolidated under this runs statuses, and only the file timestamps would tell a reader it was stale.
         consolidated_data["secrets"] = {
             "status": "performed_with_findings" if has_findings else "performed_no_findings",
             "report": secrets_data,
@@ -228,6 +232,7 @@ def consolidate_reports(output_filename="consolidated_report.json", tool_statuse
                 line = line.strip()
                 if line:
                     try:
+                        # A line that fails to parse is logged and dropped, not counted anywhere. The consolidated list can therefore be shorter than the file nuclei wrote, with the only trace in the log of a run that may already be over.
                         entries.append(json.loads(line))
                     except json.JSONDecodeError as e:
                         logging.error(f"Error decoding a nuclei output line: {e}")
@@ -262,6 +267,7 @@ def perform_scan(target, tools=None):
         if re.match(r'^(http|https)://', target):
             # Assume it is a remote repository URL
             logging.info(f"Target '{target}' looks like a remote URL - attempting to clone.")
+            # The clone lands in the working directory, not the system temp area, because the report files also live here and the tools expect to run where they were started. The finally below removes it, but a killed process leaves the clone behind with the scan target inside it.
             temp_dir = tempfile.mkdtemp(prefix="temp_repo_", dir=".")
             clone_repository(target, temp_dir)
             scan_target = temp_dir # Set the path to scan to the cloned repo
@@ -289,6 +295,7 @@ def perform_scan(target, tools=None):
                 # A False result from a tool that is not on PATH is a
                 # missing tool; the tool functions already logged which.
                 import shutil as _shutil
+                # Missing versus failed is decided after the fact, by looking the tool up on PATH a second time. A tool that was present and crashed reads as failed, and one that was never there reads as missing, but a tool removed mid run would be mislabelled, because the lookup is not the run.
                 statuses[name] = "missing" if _shutil.which(name) is None else "failed"
                 logging.error(f"Tool {name} did not run successfully ({missing_hint}).")
 
@@ -354,6 +361,7 @@ def schedule_scan(target, schedule_type, tools=None):
         return False
 
     logging.info(f"Scan scheduled for target: {target} with schedule: {schedule_type}")
+    # This loop has no exit of its own. A scheduled run ends only when the process is killed or the job raises, so whoever starts a daily scan owns stopping it, and the log is the only record it ever ran.
     while True:
         schedule.run_pending()
         time.sleep(60)  # Check every minute

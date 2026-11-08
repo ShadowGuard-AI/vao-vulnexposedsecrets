@@ -22,13 +22,29 @@ TESTSSL_REPORT_FILENAME = "testssl_report.json"
 VULN_REPORT_FILENAME = NUCLEI_REPORT_FILENAME  # Kept for compatibility; nuclei output only
 
 
+_EMBEDDED_SECRET_RE = re.compile(r"(?i)((?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|client[_-]?secret|password|passwd|pwd|token|secret)\s*[:=]\s*[\"']?)([^\s\"',;]+)")
+
+def _mask_embedded_secrets(text):
+    """Mask secret values embedded in a source line."""
+    def _repl(match):
+        value = match.group(2)
+        if "[REDACTED" in value:
+            return match.group(0)
+        digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:8]
+        return f"{match.group(1)}{value[:4]}...[REDACTED sha256:{digest}]"
+    return _EMBEDDED_SECRET_RE.sub(_repl, text)
+
 def mask_secret_values(obj):
     """Recursively mask values held under secret-like keys."""
     if isinstance(obj, dict):
         out = {}
         for key, value in obj.items():
             lowered = str(key).lower()
-            if isinstance(value, str) and "[REDACTED" not in value and any(word in lowered for word in ("secret", "password", "token", "api_key", "apikey")):
+            if lowered == "hashed_secret":
+                out[key] = value
+            elif lowered == "line" and isinstance(value, str):
+                out[key] = _mask_embedded_secrets(value)
+            elif isinstance(value, str) and "[REDACTED" not in value and any(word in lowered for word in ("secret", "password", "token", "api_key", "apikey")):
                 # Masking keeps the first four characters plus a short hash prefix. That is enough to match two reports against each other and tell whether a value changed, and it is also the first four characters of a secret in plain view, so I would not share a masked report further than I would share the finding itself.
                 digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:8]
                 out[key] = f"{value[:4]}...[REDACTED sha256:{digest}]"
@@ -210,15 +226,20 @@ def consolidate_reports(output_filename="consolidated_report.json", tool_statuse
     # Secrets report: distinguish not performed, performed with no
     # findings, and performed with findings.
     if os.path.exists(SECRETS_REPORT_FILENAME):
-        with open(SECRETS_REPORT_FILENAME, "r") as f:
-            secrets_data = mask_secret_values(json.load(f))
-        results_map = secrets_data.get("results", {}) if isinstance(secrets_data, dict) else {}
-        has_findings = bool(results_map) and any(results_map.values())
-        # This reads whatever secrets report file sits in the working directory. If the current run failed before writing a fresh one, a file left by an earlier run is consolidated under this runs statuses, and only the file timestamps would tell a reader it was stale.
-        consolidated_data["secrets"] = {
-            "status": "performed_with_findings" if has_findings else "performed_no_findings",
-            "report": secrets_data,
-        }
+        try:
+            with open(SECRETS_REPORT_FILENAME, "r") as f:
+                secrets_data = mask_secret_values(json.load(f))
+        except (json.JSONDecodeError, OSError) as e:
+            logging.error(f"Error decoding secrets report: {e}")
+            consolidated_data["secrets"] = {"status": "unreadable", "error": "Failed to decode secrets report."}
+            secrets_data = None
+        if secrets_data is not None:
+            results_map = secrets_data.get("results", {}) if isinstance(secrets_data, dict) else {}
+            has_findings = bool(results_map) and any(results_map.values())
+            consolidated_data["secrets"] = {
+                "status": "performed_with_findings" if has_findings else "performed_no_findings",
+                "report": secrets_data,
+            }
     else:
         consolidated_data["secrets"] = {"status": "not_performed"}
 
